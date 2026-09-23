@@ -34,6 +34,26 @@ const (
 	ovpnTempPath    = "/tmp/current.ovpn"
 )
 
+var (
+	httpClient = &http.Client{Timeout: 15 * time.Second}
+	ipClient   = &http.Client{Timeout: 5 * time.Second}
+
+	proxyTransport = &http.Transport{
+		Proxy:               nil,
+		DialContext:         (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+		MaxIdleConns:        100,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+
+	proxyBufPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 32*1024)
+			return &b
+		},
+	}
+)
+
 type ServerInfo struct {
 	HostName     string    `json:"hostname"`
 	IP           string    `json:"ip"`
@@ -137,8 +157,7 @@ func (m *Manager) purgeHistory() {
 }
 
 func (m *Manager) fetchServers() ([]ServerInfo, error) {
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(vpngateAPIURL)
+	resp, err := httpClient.Get(vpngateAPIURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch VPNGate CSV: %w", err)
 	}
@@ -148,36 +167,32 @@ func (m *Manager) fetchServers() ([]ServerInfo, error) {
 		return nil, fmt.Errorf("unexpected status %d from VPNGate", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading response: %w", err)
-	}
-
-	lines := strings.Split(string(body), "\n")
-	var csvLines []string
-	for _, l := range lines {
-		l = strings.TrimSpace(l)
-		if strings.HasPrefix(l, "*") || l == "" {
-			continue
+	pr, pw := io.Pipe()
+	go func() {
+		scanner := bufio.NewScanner(resp.Body)
+		buf := make([]byte, 64*1024)
+		scanner.Buffer(buf, 1024*1024)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "*") {
+				continue
+			}
+			if strings.HasPrefix(line, "#") {
+				line = strings.TrimPrefix(line, "#")
+			}
+			_, _ = io.WriteString(pw, line+"\n")
 		}
-		if strings.HasPrefix(l, "#") {
-			l = strings.TrimPrefix(l, "#")
-		}
-		csvLines = append(csvLines, l)
-	}
+		_ = pw.CloseWithError(scanner.Err())
+	}()
 
-	reader := csv.NewReader(strings.NewReader(strings.Join(csvLines, "\n")))
+	reader := csv.NewReader(pr)
 	reader.LazyQuotes = true
-	records, err := reader.ReadAll()
+
+	header, err := reader.Read()
 	if err != nil {
-		return nil, fmt.Errorf("parsing CSV: %w", err)
+		return nil, fmt.Errorf("parsing CSV header: %w", err)
 	}
 
-	if len(records) < 2 {
-		return nil, errors.New("CSV contains no data rows")
-	}
-
-	header := records[0]
 	idxMap := make(map[string]int)
 	for i, h := range header {
 		idxMap[strings.TrimSpace(h)] = i
@@ -191,7 +206,15 @@ func (m *Manager) fetchServers() ([]ServerInfo, error) {
 	}
 
 	var servers []ServerInfo
-	for _, row := range records[1:] {
+	for {
+		row, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			continue
+		}
+
 		if len(row) <= idxMap["CountryShort"] {
 			continue
 		}
@@ -231,6 +254,10 @@ func (m *Manager) fetchServers() ([]ServerInfo, error) {
 		}
 
 		servers = append(servers, s)
+	}
+
+	if len(servers) == 0 {
+		return nil, errors.New("no valid JP servers found in CSV")
 	}
 
 	return servers, nil
@@ -469,7 +496,6 @@ func sanitizeOVPNConfig(raw string) string {
 }
 
 func fetchPublicIP() (string, error) {
-	client := &http.Client{Timeout: 5 * time.Second}
 	endpoints := []string{
 		"http://api.ipify.org",
 		"http://ifconfig.me/ip",
@@ -477,7 +503,7 @@ func fetchPublicIP() (string, error) {
 	}
 
 	for _, ep := range endpoints {
-		resp, err := client.Get(ep)
+		resp, err := ipClient.Get(ep)
 		if err == nil && resp.StatusCode == http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
@@ -558,11 +584,15 @@ func handleHTTPSConnect(w http.ResponseWriter, r *http.Request) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(destConn, clientConn)
+		buf := proxyBufPool.Get().(*[]byte)
+		defer proxyBufPool.Put(buf)
+		_, _ = io.CopyBuffer(destConn, clientConn, *buf)
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(clientConn, destConn)
+		buf := proxyBufPool.Get().(*[]byte)
+		defer proxyBufPool.Put(buf)
+		_, _ = io.CopyBuffer(clientConn, destConn, *buf)
 	}()
 	wg.Wait()
 }
@@ -580,15 +610,7 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	outReq.RequestURI = ""
 	outReq.Header.Del("Proxy-Connection")
 
-	transport := &http.Transport{
-		Proxy:               nil,
-		DialContext:         (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
-		MaxIdleConns:        100,
-		IdleConnTimeout:     90 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
-	}
-
-	resp, err := transport.RoundTrip(outReq)
+	resp, err := proxyTransport.RoundTrip(outReq)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("RoundTrip failed: %v", err), http.StatusBadGateway)
 		return

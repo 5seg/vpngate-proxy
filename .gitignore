@@ -8,3 +8,6 @@ data/
 vpngate-proxy
 *.exe
 *.test
+
+# Tool cache & metadata
+.commandcode/
