@@ -1,0 +1,10 @@
+# Data and persistence
+data/
+/data/
+/tmp/
+*.ovpn
+
+# Go binaries
+vpngate-proxy
+*.exe
+*.test

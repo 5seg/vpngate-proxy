@@ -1,0 +1,14 @@
+services:
+  vpngate-proxy:
+    build: .
+    container_name: vpngate-proxy
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "1080:1080" # HTTP/HTTPS Proxy
+      - "8080:8080" # Management REST API
+    volumes:
+      - ./data:/data
